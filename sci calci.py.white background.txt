@@ -1,0 +1,476 @@
+sci calci .basic
+
+
+
+
+
+ #!/usr/bin/env python3
+"""
+fx991cw_advanced.py
+
+Advanced scientific calculator (single-file).
+Features:
+ - Expression evaluation with safe namespace
+ - Trig (deg/rad), inverse, hyperbolic
+ - log, ln, exp, power, roots
+ - factorial, nPr, nCr
+ - complex numbers (use 'j' like Python)
+ - memory (M+, M-, MR, MC)
+ - history pane (click to reuse)
+ - keyboard entry support for digits/operators/enter/backspace
+"""
+
+import math
+import cmath
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, font
+from functools import partial
+from collections import deque
+import operator
+import numbers
+
+# ---------------------------
+# Safe evaluation environment
+# ---------------------------
+
+# helper functions not in math
+def factorial(n):
+    if isinstance(n, complex):
+        raise ValueError("factorial() not defined for complex numbers")
+    n_int = int(n)
+    if n_int != n or n_int < 0:
+        raise ValueError("factorial() only defined for non-negative integers")
+    return math.factorial(n_int)
+
+def nPr(n, r):
+    n_int = int(n)
+    r_int = int(r)
+    if n_int != n or r_int != r or n_int < 0 or r_int < 0:
+        raise ValueError("nPr arguments must be non-negative integers")
+    if r_int > n_int:
+        return 0
+    return math.perm(n_int, r_int) if hasattr(math, "perm") else math.factorial(n_int)//math.factorial(n_int-r_int)
+
+def nCr(n, r):
+    n_int = int(n)
+    r_int = int(r)
+    if n_int != n or r_int != r or n_int < 0 or r_int < 0:
+        raise ValueError("nCr arguments must be non-negative integers")
+    if r_int > n_int:
+        return 0
+    return math.comb(n_int, r_int) if hasattr(math, "comb") else math.factorial(n_int)//(math.factorial(r_int)*math.factorial(n_int-r_int))
+
+# degree/radian toggle will affect trig functions; we'll create wrapper functions that consult mode
+TRIG_MODE = {"mode": "RAD"}  # global mode state container so wrappers can read/write
+
+def _to_rad(x):
+    return x if TRIG_MODE['mode'] == 'RAD' else math.radians(x)
+
+def _from_rad(x):
+    return x if TRIG_MODE['mode'] == 'RAD' else math.degrees(x)
+
+# Trig wrappers (real)
+def sin(x): return math.sin(_to_rad(x)) if isinstance(x, numbers.Real) else math.sin(x)
+def cos(x): return math.cos(_to_rad(x)) if isinstance(x, numbers.Real) else math.cos(x)
+def tan(x): return math.tan(_to_rad(x)) if isinstance(x, numbers.Real) else math.tan(x)
+
+def asin(x):
+    res = math.asin(x)
+    return _from_rad(res)
+
+def acos(x):
+    res = math.acos(x)
+    return _from_rad(res)
+
+def atan(x):
+    res = math.atan(x)
+    return _from_rad(res)
+
+# hyperbolic (these are not affected by deg/rad)
+def sinh(x): return math.sinh(x)
+def cosh(x): return math.cosh(x)
+def tanh(x): return math.tanh(x)
+def asinh(x): return math.asinh(x)
+def acosh(x): return math.acosh(x)
+def atanh(x): return math.atanh(x)
+
+# complex variants (user can use cmath.* directly if needed)
+def csin(x): return cmath.sin(x)
+def ccos(x): return cmath.cos(x)
+def ctan(x): return cmath.tan(x)
+
+# other helpers
+def log(x, base=10):
+    # default base 10 to mimic calculator log
+    if base == 10:
+        return math.log10(x)
+    return math.log(x, base)
+
+def ln(x):
+    return math.log(x)
+
+def sqrt(x):
+    if isinstance(x, complex):
+        return cmath.sqrt(x)
+    if x < 0:
+        return cmath.sqrt(x)
+    return math.sqrt(x)
+
+def root(x, n):
+    # nth root (real/complex)
+    n = float(n)
+    if n == 0:
+        raise ValueError("root: zero-degree")
+    return x ** (1.0 / n)
+
+# safe names for eval
+SAFE_MATH = {
+    # math constants
+    "pi": math.pi, "e": math.e,
+    # basic
+    "abs": abs, "round": round,
+    # math functions
+    "sin": sin, "cos": cos, "tan": tan,
+    "asin": asin, "acos": acos, "atan": atan,
+    "sinh": sinh, "cosh": cosh, "tanh": tanh,
+    "asinh": asinh, "acosh": acosh, "atanh": atanh,
+    "csin": csin, "ccos": ccos, "ctan": ctan,
+    "log": log, "ln": ln, "sqrt": sqrt, "root": root,
+    "exp": math.exp, "pow": pow,
+    # combinatorics
+    "fact": factorial, "factorial": factorial, "nPr": nPr, "nCr": nCr,
+    # complex helpers
+    "i": 1j, "j": 1j,
+    # built-ins
+    "pi": math.pi, "e": math.e,
+    # allow cmath too
+    "cmath": cmath,
+    # numeric constructors
+    "int": int, "float": float, "complex": complex,
+}
+
+# For extra safety, disable builtins by default in eval namespace
+EVAL_GLOBALS = {"__builtins__": {}}
+EVAL_GLOBALS.update(SAFE_MATH)
+
+# ---------------------------
+# GUI and application logic
+# ---------------------------
+
+MAX_HISTORY = 200
+
+class SciCalculator(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("FX-991CW Advanced - Python")
+        self.geometry("920x600")
+        self.minsize(760, 480)
+        self.configure(bg="#f0f0f0")
+
+        # fonts
+        self.font_large = font.Font(size=14)
+        self.font_mono = font.Font(family="Courier", size=12)
+
+        # state
+        self.memory = 0.0
+        self.history = deque(maxlen=MAX_HISTORY)
+        self.last_result = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        # top frame: expression entry and mode/memory
+        top = ttk.Frame(self)
+        top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
+
+        self.entry_var = tk.StringVar()
+        entry = ttk.Entry(top, textvariable=self.entry_var, font=self.font_large)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0,8))
+        entry.bind("<Return>", lambda e: self.evaluate())
+        entry.bind("<KP_Enter>", lambda e: self.evaluate())
+        entry.bind("<Escape>", lambda e: self.clear_all())
+        entry.bind("<BackSpace>", lambda e: None)  # leave default
+        self.entry = entry
+
+        buttons_frame = ttk.Frame(top)
+        buttons_frame.pack(side=tk.RIGHT)
+
+        # mode toggle
+        self.mode_var = tk.StringVar(value="RAD")
+        def toggle_mode():
+            new = "DEG" if self.mode_var.get() == "RAD" else "RAD"
+            self.mode_var.set(new)
+            TRIG_MODE['mode'] = new
+            mode_btn.config(text=new)
+        mode_btn = ttk.Button(buttons_frame, text=self.mode_var.get(), width=6, command=toggle_mode)
+        mode_btn.pack(side=tk.TOP, padx=2, pady=2)
+
+        # memory buttons
+        mem_frame = ttk.Frame(buttons_frame)
+        mem_frame.pack(side=tk.TOP, padx=2, pady=2)
+        ttk.Button(mem_frame, text="M+", width=4, command=self.mem_add).pack(side=tk.LEFT, padx=2)
+        ttk.Button(mem_frame, text="M-", width=4, command=self.mem_sub).pack(side=tk.LEFT, padx=2)
+        ttk.Button(mem_frame, text="MR", width=4, command=self.mem_recall).pack(side=tk.LEFT, padx=2)
+        ttk.Button(mem_frame, text="MC", width=4, command=self.mem_clear).pack(side=tk.LEFT, padx=2)
+
+        # center: buttons & keypad
+        center = ttk.Frame(self)
+        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=6)
+
+        # left: keypad
+        keypad = ttk.Frame(center)
+        keypad.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # keypad layout: a list of rows, each row is list of (label, command)
+        # commands will insert text to entry or call functions
+        rows = [
+            [("(", lambda: self.insert("(")), (")", lambda: self.insert(")")), ("%", lambda: self.insert("/100")), ("Ans", lambda: self.insert_ans()), ("C", lambda: self.clear_all())],
+            [("7", lambda: self.insert("7")), ("8", lambda: self.insert("8")), ("9", lambda: self.insert("9")), ("÷", lambda: self.insert("/")), ("^", lambda: self.insert("**"))],
+            [("4", lambda: self.insert("4")), ("5", lambda: self.insert("5")), ("6", lambda: self.insert("6")), ("×", lambda: self.insert("*")), ("√", lambda: self.insert("sqrt("))],
+            [("1", lambda: self.insert("1")), ("2", lambda: self.insert("2")), ("3", lambda: self.insert("3")), ("-", lambda: self.insert("-")), ("x!", lambda: self.insert("fact("))],
+            [("0", lambda: self.insert("0")), (".", lambda: self.insert(".")), ("+/-", lambda: self.negate()), ("+", lambda: self.insert("+")), ("=", lambda: self.evaluate())],
+        ]
+
+        for r, row in enumerate(rows):
+            fr = ttk.Frame(keypad)
+            fr.pack(side=tk.TOP, fill=tk.X, pady=2)
+            for label, cmd in row:
+                btn = ttk.Button(fr, text=label, command=cmd)
+                btn.pack(side=tk.LEFT, padx=3, ipadx=6, ipady=6, expand=True, fill=tk.X)
+
+        # right: functions
+        func_frame = ttk.Frame(center)
+        func_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(8,0))
+
+        func_rows = [
+            [("sin", "sin("), ("cos", "cos("), ("tan", "tan("), ("asin", "asin("), ("acos", "acos(")],
+            [("atan","atan("), ("sinh","sinh("), ("cosh","cosh("), ("tanh","tanh("), ("ln","ln(")],
+            [("log10","log("), ("exp","exp("), ("pow","**"), ("root","root("), ("abs","abs(")],
+            [("nPr","nPr("), ("nCr","nCr("), ("perm","nPr("), ("comb","nCr("), ("i","1j")],
+            [("pi","pi"), ("e","e"), ("(", "("), (")", ")"), ("clr", lambda: self.clear_entry())]
+        ]
+        for row in func_rows:
+            fr = ttk.Frame(func_frame)
+            fr.pack(side=tk.TOP, fill=tk.X, pady=2)
+            for label, action in row:
+                if callable(action):
+                    cmd = action
+                else:
+                    cmd = lambda a=action: self.insert(a)
+                btn = ttk.Button(fr, text=label, width=8, command=cmd)
+                btn.pack(side=tk.LEFT, padx=2, ipady=6)
+
+        # rightmost: history and result
+        right_col = ttk.Frame(self)
+        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, padx=8, pady=6)
+
+        ttk.Label(right_col, text="History", font=self.font_large).pack(side=tk.TOP, anchor=tk.W)
+        self.history_box = scrolledtext.ScrolledText(right_col, width=34, height=18, state=tk.DISABLED, wrap=tk.WORD, font=self.font_mono)
+        self.history_box.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.history_box.bind("<1>", lambda e: "break")  # disable direct editing
+        # click on line to reuse
+        self.history_box.bind("<Button-1>", self.on_history_click)
+
+        # result display
+        res_frame = ttk.Frame(right_col)
+        res_frame.pack(side=tk.TOP, fill=tk.X, pady=(6,0))
+        ttk.Label(res_frame, text="Result:", font=self.font_large).pack(side=tk.LEFT)
+        self.result_var = tk.StringVar(value="")
+        ttk.Label(res_frame, textvariable=self.result_var, font=self.font_large, foreground="blue").pack(side=tk.LEFT, padx=8)
+
+        # bottom: additional features
+        bottom = ttk.Frame(self)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=6)
+
+        ttk.Button(bottom, text="CLR History", command=self.clear_history).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bottom, text="Copy Result", command=self.copy_result).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bottom, text="About", command=self.show_about).pack(side=tk.RIGHT, padx=4)
+
+        # keyboard bindings
+        for k in "0123456789+-*/().%":
+            self.bind(k, lambda e, ch=k: self.insert(ch))
+        self.bind("<Return>", lambda e: self.evaluate())
+        self.bind("<BackSpace>", self._backspace)
+        self.bind("<Delete>", lambda e: self.clear_entry())
+        self.bind("<Control-c>", lambda e: self.copy_result())
+        self.bind("<Control-C>", lambda e: self.copy_result())
+
+    # ----------------------------------
+    # Entry / display / helper methods
+    # ----------------------------------
+    def insert(self, txt):
+        cur = self.entry_var.get()
+        idx = self.entry.index(tk.INSERT)
+        self.entry_var.set(cur[:idx] + txt + cur[idx:])
+        self.entry.icursor(idx + len(txt))
+        self.entry.focus_set()
+
+    def clear_entry(self):
+        self.entry_var.set("")
+        self.entry.focus_set()
+
+    def clear_all(self):
+        self.entry_var.set("")
+        self.result_var.set("")
+        self.last_result = None
+        self.entry.focus_set()
+
+    def copy_result(self):
+        res = self.result_var.get()
+        if res:
+            self.clipboard_clear()
+            self.clipboard_append(res)
+            messagebox.showinfo("Copied", "Result copied to clipboard")
+
+    def show_about(self):
+        messagebox.showinfo("About", "FX-991CW Advanced (Python)\nFeatures: advanced math, trig modes, memory, history.\nAuthor: Generated by ChatGPT\nRun locally only.")
+
+    def negate(self):
+        txt = self.entry_var.get()
+        if not txt:
+            self.insert("-")
+            return
+        idx = self.entry.index(tk.INSERT)
+        # try to find last number and negate it (simple approach)
+        # If caret at end, try simple parse
+        try:
+            val = float(txt)
+            if val == 0:
+                return
+            self.entry_var.set(str(-val))
+            return
+        except Exception:
+            # fallback: just insert unary minus
+            self.insert("-")
+
+    def insert_ans(self):
+        if self.last_result is None:
+            return
+        self.insert(str(self.last_result))
+
+    def mem_add(self):
+        try:
+            val = self._safe_eval(self.entry_var.get()) if self.entry_var.get().strip() else 0.0
+            if isinstance(val, complex):
+                # store real part for memory (match many calculators)
+                val = val.real
+            self.memory += float(val)
+            messagebox.showinfo("Memory", f"Memory updated: {self.memory}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Memory add failed: {e}")
+
+    def mem_sub(self):
+        try:
+            val = self._safe_eval(self.entry_var.get()) if self.entry_var.get().strip() else 0.0
+            if isinstance(val, complex):
+                val = val.real
+            self.memory -= float(val)
+            messagebox.showinfo("Memory", f"Memory updated: {self.memory}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Memory sub failed: {e}")
+
+    def mem_recall(self):
+        self.insert(str(self.memory))
+
+    def mem_clear(self):
+        self.memory = 0.0
+        messagebox.showinfo("Memory", "Memory cleared")
+
+    def clear_history(self):
+        self.history.clear()
+        self._refresh_history_box()
+
+    def on_history_click(self, event):
+        idx = "@%d,%d" % (event.x, event.y)
+        try:
+            index = self.history_box.index(idx)
+            # index like "2.0" -> get line start
+            line = int(float(index))
+            content = self._get_history_line(line)
+            if content:
+                # history lines stored as "expr = result"
+                expr = content.split("=", 1)[0].strip()
+                self.entry_var.set(expr)
+        except Exception:
+            pass
+
+    def _get_history_line(self, line_number):
+        # return specific line text (1-indexed)
+        try:
+            return self.history_box.get(f"{line_number}.0", f"{line_number}.end")
+        except Exception:
+            return None
+
+    def _backspace(self, event):
+        txt = self.entry_var.get()
+        idx = self.entry.index(tk.INSERT)
+        if idx > 0:
+            new = txt[:idx-1] + txt[idx:]
+            self.entry_var.set(new)
+            self.entry.icursor(idx-1)
+
+    # ----------------------------------
+    # Evaluation and history
+    # ----------------------------------
+    def evaluate(self):
+        expr = self.entry_var.get().strip()
+        if not expr:
+            return
+        try:
+            val = self._safe_eval(expr)
+            self.last_result = val
+            disp = self._format_result(val)
+            self.result_var.set(disp)
+            self._push_history(expr, disp)
+        except Exception as e:
+            self.result_var.set("Error")
+            messagebox.showerror("Evaluation Error", str(e))
+
+    def _safe_eval(self, expression):
+        # Basic sanitization: replace unicode operators with python equivalents
+        expr = expression.replace("×", "*").replace("÷", "/").replace("^", "**")
+        # Allow using 'Ans' or 'ans' as last result
+        if self.last_result is not None:
+            expr = expr.replace("Ans", str(self.last_result)).replace("ans", str(self.last_result))
+        # Evaluate using restricted globals
+        # We also provide local namespace empty
+        # For trig degree/rad, wrappers already consult TRIG_MODE variable
+        try:
+            result = eval(expr, EVAL_GLOBALS, {})
+        except Exception as e:
+            # attempt to provide more informative errors
+            raise
+        return result
+
+    def _format_result(self, val):
+        # format complex and real numbers nicely
+        if isinstance(val, complex):
+            return str(val)
+        # if integer-like
+        if abs(val - round(val)) < 1e-12:
+            return str(int(round(val)))
+        # otherwise pretty float with up to 12 significant digits
+        return "{:.12g}".format(val)
+
+    def _push_history(self, expr, result_text):
+        entry = f"{expr} = {result_text}"
+        self.history.appendleft(entry)
+        self._refresh_history_box()
+
+    def _refresh_history_box(self):
+        self.history_box.configure(state=tk.NORMAL)
+        self.history_box.delete("1.0", tk.END)
+        for item in self.history:
+            self.history_box.insert(tk.END, item + "\n")
+        self.history_box.configure(state=tk.DISABLED)
+
+# ---------------------------
+# Main entrypoint
+# ---------------------------
+
+def main():
+    app = SciCalculator()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
